@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os,re,sys,time,random,requests
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
@@ -349,6 +350,21 @@ def main():
             # 获取旧到期时间
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
+            # 判断是否已经进入续期窗口
+try:
+    due_date = datetime.strptime(old_due, "%d %b %Y").date()
+    today = datetime.now().date()
+    days_left = (due_date - today).days
+
+    log(f"📅 距离到期还有 {days_left} 天")
+
+    if days_left > 1:
+        log("⏳ 未到续期时间，跳过本次续期")
+        status = "⏳ 未到续期时间"
+        send_telegram_notification(status, old_due, old_due)
+        sys.exit(0)
+except Exception as e:
+    log(f"⚠️ 到期日期解析失败，继续尝试续期: {e}")
 
             # 执行续费
             renew_result = renew_service(page)
