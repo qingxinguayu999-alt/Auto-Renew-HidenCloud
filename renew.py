@@ -9,7 +9,6 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://dash.hidencloud.com"
 
-# HidenCloud 当前使用的 remember cookie 名称
 REMEMBER_COOKIE_NAME = (
     "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
 )
@@ -17,7 +16,11 @@ REMEMBER_COOKIE_NAME = (
 COOKIE_VALUE = os.getenv("COOKIE_VALUE", "").strip()
 EMAIL = os.getenv("EMAIL", "").strip()
 
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+
 RENEW_DAYS = 10
+
 
 session = requests.Session()
 
@@ -42,10 +45,58 @@ def log(message):
 def mask_email(email):
     if not email or "@" not in email:
         return "未设置"
+
     name, domain = email.split("@", 1)
+
     if len(name) <= 2:
         return f"**@{domain}"
+
     return f"{name[:2]}***@{domain}"
+
+
+def send_tg(message):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("⚠️ Telegram 配置不存在，跳过通知。")
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": TG_CHAT_ID,
+                "text": message,
+            },
+            timeout=20,
+        )
+
+        data = response.json()
+
+        if data.get("ok"):
+            log("📨 Telegram 通知发送成功。")
+            return True
+
+        log(
+            "❌ Telegram 通知失败："
+            + str(data.get("description", "未知错误"))
+        )
+
+        return False
+
+    except Exception as exc:
+        log(f"❌ Telegram 通知异常：{exc}")
+        return False
+
+
+def fatal(message):
+    log(message)
+
+    send_tg(
+        "❌ HidenCloud 自动续期异常\n"
+        f"账号：{mask_email(EMAIL)}\n"
+        f"{message}"
+    )
+
+    sys.exit(1)
 
 
 def check_cloudflare(response):
@@ -63,7 +114,11 @@ def check_cloudflare(response):
 
 
 def request(method, path, **kwargs):
-    url = path if path.startswith("http") else urljoin(BASE_URL, path)
+    url = (
+        path
+        if path.startswith("http")
+        else urljoin(BASE_URL, path)
+    )
 
     response = session.request(
         method,
@@ -83,11 +138,19 @@ def request(method, path, **kwargs):
 def get_csrf(html):
     soup = BeautifulSoup(html, "html.parser")
 
-    field = soup.find("input", attrs={"name": "_token"})
+    field = soup.find(
+        "input",
+        attrs={"name": "_token"},
+    )
+
     if field and field.get("value"):
         return field["value"]
 
-    meta = soup.find("meta", attrs={"name": "csrf-token"})
+    meta = soup.find(
+        "meta",
+        attrs={"name": "csrf-token"},
+    )
+
     if meta and meta.get("content"):
         return meta["content"]
 
@@ -95,9 +158,10 @@ def get_csrf(html):
 
 
 def get_due_date(html):
-    text = BeautifulSoup(html, "html.parser").get_text(
-        " ", strip=True
-    )
+    text = BeautifulSoup(
+        html,
+        "html.parser",
+    ).get_text(" ", strip=True)
 
     patterns = [
         r"Due date\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
@@ -105,7 +169,12 @@ def get_due_date(html):
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.I)
+        match = re.search(
+            pattern,
+            text,
+            re.I,
+        )
+
         if match:
             return match.group(1)
 
@@ -115,54 +184,93 @@ def get_due_date(html):
 def find_services(html):
     ids = set()
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
 
-    for link in soup.find_all("a", href=True):
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
         match = re.search(
             r"/service/(\d+)/manage",
-            link["href"]
+            link["href"],
         )
+
         if match:
-            ids.add(match.group(1))
+            ids.add(
+                match.group(1)
+            )
 
     return sorted(ids)
 
 
 def find_payment(html, current_url):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
 
-    # 优先找支付表单
     for form in soup.find_all("form"):
         button_text = " ".join(
-            button.get_text(" ", strip=True)
-            for button in form.find_all("button")
+            button.get_text(
+                " ",
+                strip=True,
+            )
+            for button in form.find_all(
+                "button"
+            )
         ).lower()
 
         action = form.get("action")
 
-        if "pay" in button_text and action and "balance/add" not in action:
+        if (
+            "pay" in button_text
+            and action
+            and "balance/add" not in action
+        ):
             data = {}
 
-            for field in form.find_all("input"):
+            for field in form.find_all(
+                "input"
+            ):
                 name = field.get("name")
 
                 if name:
-                    data[name] = field.get("value", "")
+                    data[name] = field.get(
+                        "value",
+                        "",
+                    )
 
             return {
                 "type": "form",
-                "url": urljoin(current_url, action),
+                "url": urljoin(
+                    current_url,
+                    action,
+                ),
                 "data": data,
             }
 
-    # 再寻找 Pay 链接
-    for link in soup.find_all("a", href=True):
-        text = link.get_text(" ", strip=True).lower()
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
+        text = link.get_text(
+            " ",
+            strip=True,
+        ).lower()
 
-        if text == "pay" or text.startswith("pay "):
+        if (
+            text == "pay"
+            or text.startswith("pay ")
+        ):
             return {
                 "type": "link",
-                "url": urljoin(current_url, link["href"]),
+                "url": urljoin(
+                    current_url,
+                    link["href"],
+                ),
             }
 
     return None
@@ -175,10 +283,16 @@ def pay_invoice(response):
     )
 
     if not payment:
-        log("⚪ 没找到支付按钮，可能账单已支付。")
+        log(
+            "⚪ 没找到支付按钮，"
+            "可能账单已经支付。"
+        )
         return True
 
-    log("💳 找到支付入口，准备支付免费续期账单……")
+    log(
+        "💳 找到支付入口，"
+        "准备支付免费续期账单……"
+    )
 
     if payment["type"] == "form":
         result = request(
@@ -189,6 +303,7 @@ def pay_invoice(response):
                 "Referer": response.url,
             },
         )
+
     else:
         result = request(
             "GET",
@@ -212,27 +327,47 @@ def check_unpaid_invoice(service_id):
         f"/service/{service_id}/invoices?where=unpaid",
     )
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
 
     invoice_urls = []
 
-    for link in soup.find_all("a", href=True):
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
         href = link["href"]
 
-        if "/invoice/" in href and "download" not in href:
+        if (
+            "/invoice/" in href
+            and "download" not in href
+        ):
             invoice_urls.append(
-                urljoin(response.url, href)
+                urljoin(
+                    response.url,
+                    href,
+                )
             )
 
-    invoice_urls = list(dict.fromkeys(invoice_urls))
+    invoice_urls = list(
+        dict.fromkeys(invoice_urls)
+    )
 
     if not invoice_urls:
         return False
 
-    log(f"📄 找到 {len(invoice_urls)} 个未支付账单。")
+    log(
+        f"📄 找到 {len(invoice_urls)} "
+        "个未支付账单。"
+    )
 
     for invoice_url in invoice_urls:
-        invoice = request("GET", invoice_url)
+        invoice = request(
+            "GET",
+            invoice_url,
+        )
 
         if not pay_invoice(invoice):
             return False
@@ -245,20 +380,37 @@ def renew_service(service_id):
     log("=" * 50)
     log(f"🖥️ 处理服务 #{service_id}")
 
-    manage_url = f"/service/{service_id}/manage"
+    manage_url = (
+        f"/service/{service_id}/manage"
+    )
 
-    manage = request("GET", manage_url)
+    manage = request(
+        "GET",
+        manage_url,
+    )
 
-    csrf = get_csrf(manage.text)
-    old_due = get_due_date(manage.text)
+    csrf = get_csrf(
+        manage.text
+    )
 
-    log(f"📅 当前到期时间：{old_due}")
+    old_due = get_due_date(
+        manage.text
+    )
+
+    log(
+        f"📅 当前到期时间：{old_due}"
+    )
 
     if not csrf:
-        log("❌ 没找到 CSRF Token，页面结构可能已变化。")
+        log(
+            "❌ 没找到 CSRF Token，"
+            "页面结构可能已经变化。"
+        )
         return False
 
-    log(f"🔄 尝试续期 {RENEW_DAYS} 天……")
+    log(
+        f"🔄 尝试续期 {RENEW_DAYS} 天……"
+    )
 
     renew = request(
         "POST",
@@ -268,64 +420,102 @@ def renew_service(service_id):
             "days": str(RENEW_DAYS),
         },
         headers={
-            "Referer": urljoin(BASE_URL, manage_url),
+            "Referer": urljoin(
+                BASE_URL,
+                manage_url,
+            ),
             "X-CSRF-TOKEN": csrf,
         },
     )
 
     page_text = BeautifulSoup(
         renew.text,
-        "html.parser"
-    ).get_text(" ", strip=True).lower()
+        "html.parser",
+    ).get_text(
+        " ",
+        strip=True,
+    ).lower()
 
     if (
         "renewal restricted" in page_text
         or "can only renew" in page_text
         or "not eligible" in page_text
     ):
-        log("⏳ 还没到允许续期的时间。")
+        log(
+            "⏳ 还没到允许续期的时间。"
+        )
         return True
 
-    # 如果直接进入账单页面
-    if "/invoice/" in renew.url or "/payment/invoice/" in renew.url:
+    if (
+        "/invoice/" in renew.url
+        or "/payment/invoice/" in renew.url
+    ):
         if not pay_invoice(renew):
             return False
 
     else:
-        log("🔎 检查是否生成了未支付账单……")
-        check_unpaid_invoice(service_id)
+        log(
+            "🔎 检查是否生成了"
+            "未支付账单……"
+        )
 
-    # 最后重新读取到期时间
+        check_unpaid_invoice(
+            service_id
+        )
+
     final_page = request(
         "GET",
         manage_url,
     )
 
-    new_due = get_due_date(final_page.text)
+    new_due = get_due_date(
+        final_page.text
+    )
 
-    log(f"📅 处理后的到期时间：{new_due}")
+    log(
+        f"📅 处理后的到期时间：{new_due}"
+    )
 
-    if old_due != "未知" and new_due != "未知":
+    if (
+        old_due != "未知"
+        and new_due != "未知"
+    ):
         if old_due != new_due:
-            log("🎉 续期成功，到期时间已经变化。")
+            log(
+                "🎉 续期成功，"
+                "到期时间已经变化。"
+            )
+
         else:
-            log("ℹ️ 到期时间没有变化，可能尚未到续期时间。")
+            log(
+                "ℹ️ 到期时间没有变化，"
+                "可能尚未到续期时间。"
+            )
 
     return True
 
 
 def main():
-    log("==========================================")
-    log(" HidenCloud Auto Renew")
-    log("==========================================")
+    log(
+        "=========================================="
+    )
+    log(
+        " HidenCloud Auto Renew"
+    )
+    log(
+        "=========================================="
+    )
 
     if not COOKIE_VALUE:
-        log("❌ GitHub Secret COOKIE_VALUE 没有读取到。")
-        sys.exit(1)
+        fatal(
+            "GitHub Secret COOKIE_VALUE "
+            "没有读取到。"
+        )
 
-    log(f"👤 账号：{mask_email(EMAIL)}")
+    log(
+        f"👤 账号：{mask_email(EMAIL)}"
+    )
 
-    # 注入 remember cookie
     session.cookies.set(
         REMEMBER_COOKIE_NAME,
         COOKIE_VALUE,
@@ -333,7 +523,9 @@ def main():
         path="/",
     )
 
-    log("🔐 正在使用 Cookie 登录……")
+    log(
+        "🔐 正在使用 Cookie 登录……"
+    )
 
     dashboard = request(
         "GET",
@@ -344,40 +536,78 @@ def main():
         "/auth/login" in dashboard.url
         or "/login" in dashboard.url
     ):
-        log("❌ COOKIE_VALUE 已失效，请重新获取 remember_web Cookie。")
-        sys.exit(1)
+        fatal(
+            "COOKIE_VALUE 已失效，"
+            "请重新获取 remember_web Cookie。"
+        )
 
     services = find_services(
         dashboard.text
     )
 
     if not services:
-        log("❌ 登录后没有找到任何服务器。")
-        log("可能是 Cookie 无效，或者 HidenCloud 页面结构发生变化。")
-        sys.exit(1)
+        fatal(
+            "登录后没有找到任何服务器。"
+            "可能是 Cookie 无效，"
+            "或者 HidenCloud 页面结构发生变化。"
+        )
 
-    log(f"✅ 登录成功，找到 {len(services)} 个服务：")
-    log(", ".join(f"#{x}" for x in services))
+    log(
+        f"✅ 登录成功，"
+        f"找到 {len(services)} 个服务："
+    )
+
+    log(
+        ", ".join(
+            f"#{x}"
+            for x in services
+        )
+    )
 
     success = True
 
     for service_id in services:
         try:
-            if not renew_service(service_id):
+            if not renew_service(
+                service_id
+            ):
                 success = False
 
         except Exception as exc:
             success = False
-            log(f"❌ 服务 #{service_id} 出错：{exc}")
+
+            log(
+                f"❌ 服务 #{service_id} "
+                f"出错：{exc}"
+            )
 
     log("")
     log("=" * 50)
 
     if success:
-        log("✅ 本次检查完成。")
+        log(
+            "✅ 本次检查完成。"
+        )
+
+        send_tg(
+            "✅ HidenCloud 自动续期检查完成\n"
+            f"账号：{mask_email(EMAIL)}\n"
+            f"服务数量：{len(services)}"
+        )
+
         sys.exit(0)
 
-    log("❌ 本次运行存在失败项目，请查看上面的日志。")
+    log(
+        "❌ 本次运行存在失败项目，"
+        "请查看上面的日志。"
+    )
+
+    send_tg(
+        "❌ HidenCloud 自动续期运行失败\n"
+        f"账号：{mask_email(EMAIL)}\n"
+        "请打开 GitHub Actions 查看日志。"
+    )
+
     sys.exit(1)
 
 
@@ -386,5 +616,14 @@ if __name__ == "__main__":
         main()
 
     except Exception as exc:
-        log(f"❌ 程序异常：{exc}")
+        log(
+            f"❌ 程序异常：{exc}"
+        )
+
+        send_tg(
+            "❌ HidenCloud 程序异常\n"
+            f"账号：{mask_email(EMAIL)}\n"
+            f"错误：{exc}"
+        )
+
         sys.exit(1)
