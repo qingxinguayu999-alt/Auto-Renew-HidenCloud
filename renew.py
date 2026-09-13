@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 
 import requests
@@ -8,6 +10,8 @@ from bs4 import BeautifulSoup
 
 
 BASE_URL = "https://dash.hidencloud.com"
+TIMEZONE = ZoneInfo("Asia/Shanghai")
+RENEW_DAYS = 10
 
 REMEMBER_COOKIE_NAME = (
     "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
@@ -18,7 +22,6 @@ EMAIL = os.getenv("EMAIL", "").strip()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
-RENEW_DAYS = 10
 
 session = requests.Session()
 
@@ -54,7 +57,7 @@ def mask_email(email):
 
 def send_tg(message):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("⚠️ Telegram 配置不存在，跳过通知。")
+        log("⚠️ Telegram 未配置，跳过通知。")
         return False
 
     try:
@@ -77,6 +80,7 @@ def send_tg(message):
             "❌ Telegram 通知失败："
             + str(data.get("description", "未知错误"))
         )
+
         return False
 
     except Exception as exc:
@@ -106,7 +110,7 @@ def check_cloudflare(response):
         or "cf-chl-" in text
     ):
         raise RuntimeError(
-            "遇到 Cloudflare 验证，GitHub Actions 无法直接完成。"
+            "遇到 Cloudflare 验证，无法继续。"
         )
 
 
@@ -132,16 +136,8 @@ def request(method, path, **kwargs):
     return response
 
 
-def get_csrf(html):
+def get_meta_csrf(html):
     soup = BeautifulSoup(html, "html.parser")
-
-    field = soup.find(
-        "input",
-        attrs={"name": "_token"},
-    )
-
-    if field and field.get("value"):
-        return field["value"]
 
     meta = soup.find(
         "meta",
@@ -154,75 +150,137 @@ def get_csrf(html):
     return ""
 
 
-def get_due_date(html):
-    text = BeautifulSoup(
-        html,
-        "html.parser"
-    ).get_text(" ", strip=True)
+def get_form_csrf(html):
+    soup = BeautifulSoup(html, "html.parser")
 
-    patterns = [
-        r"(?:Due date|Due Date|Expiry|Expires|Expiration)"
-        r"\s*[:\-]?\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2})",
+    field = soup.find(
+        "input",
+        attrs={"name": "_token"},
+    )
 
-        r"(?:Due date|Due Date|Expiry|Expires|Expiration)"
-        r"\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})",
+    if field and field.get("value"):
+        return field["value"]
 
-        r"(?:Due date|Due Date|Expiry|Expires|Expiration)"
-        r"\s*[:\-]?\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-
-        if match:
-            return match.group(1)
-
-    # 兜底找常见日期
-    fallback_patterns = [
-        r"\b(20\d{2}[/-]\d{1,2}[/-]\d{1,2})\b",
-        r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2})\b",
-    ]
-
-    for pattern in fallback_patterns:
-        match = re.search(pattern, text)
-
-        if match:
-            return match.group(1)
-
-    return "未知"
+    return ""
 
 
 def find_services(html):
-    ids = set()
+    service_ids = set()
 
     soup = BeautifulSoup(html, "html.parser")
 
     for link in soup.find_all("a", href=True):
         match = re.search(
             r"/service/(\d+)/manage",
-            link["href"]
+            link["href"],
         )
 
         if match:
-            ids.add(match.group(1))
+            service_ids.add(match.group(1))
 
-    return sorted(ids)
+    return sorted(service_ids)
+
+
+def parse_date_string(value):
+    value = value.strip().replace(",", "")
+
+    formats = [
+        "%Y/%m/%d",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%b %d %Y",
+        "%B %d %Y",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(
+                value,
+                fmt,
+            ).date()
+
+        except ValueError:
+            pass
+
+    return None
+
+
+def get_due_date(html):
+    text = BeautifulSoup(
+        html,
+        "html.parser",
+    ).get_text(" ", strip=True)
+
+    label = (
+        r"(?:"
+        r"Due\s*Date|"
+        r"Expiry(?:\s*Date)?|"
+        r"Expiration(?:\s*Date)?|"
+        r"Expires?|"
+        r"到期(?:时间|日期)?|"
+        r"有效期"
+        r")"
+    )
+
+    date_value = (
+        r"("
+        r"20\d{2}[/-]\d{1,2}[/-]\d{1,2}"
+        r"|"
+        r"\d{1,2}[/-]\d{1,2}[/-]20\d{2}"
+        r"|"
+        r"\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2}"
+        r"|"
+        r"[A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2}"
+        r")"
+    )
+
+    patterns = [
+        label + r".{0,50}?" + date_value,
+        date_value + r".{0,50}?" + label,
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            text,
+            re.I,
+        )
+
+        if match:
+            # 两种正则的日期分组位置不同
+            candidates = [
+                item
+                for item in match.groups()
+                if item
+                and re.search(r"20\d{2}", item)
+            ]
+
+            for candidate in candidates:
+                parsed = parse_date_string(candidate)
+
+                if parsed:
+                    return parsed
+
+    return None
 
 
 def find_payment(html, current_url):
     soup = BeautifulSoup(html, "html.parser")
 
     for form in soup.find_all("form"):
+        action = form.get("action")
+
         button_text = " ".join(
             button.get_text(" ", strip=True)
             for button in form.find_all("button")
         ).lower()
 
-        action = form.get("action")
-
         if (
-            "pay" in button_text
-            and action
+            action
+            and "pay" in button_text
             and "balance/add" not in action
         ):
             data = {}
@@ -231,60 +289,73 @@ def find_payment(html, current_url):
                 name = field.get("name")
 
                 if name:
-                    data[name] = field.get("value", "")
+                    data[name] = field.get(
+                        "value",
+                        "",
+                    )
 
             return {
                 "type": "form",
-                "url": urljoin(current_url, action),
+                "url": urljoin(
+                    current_url,
+                    action,
+                ),
                 "data": data,
             }
 
     for link in soup.find_all("a", href=True):
-        text = link.get_text(
+        link_text = link.get_text(
             " ",
-            strip=True
+            strip=True,
         ).lower()
 
-        if text == "pay" or text.startswith("pay "):
+        if (
+            link_text == "pay"
+            or link_text.startswith("pay ")
+        ):
             return {
                 "type": "link",
                 "url": urljoin(
                     current_url,
-                    link["href"]
+                    link["href"],
                 ),
             }
 
     return None
 
 
-def pay_invoice(response):
+def pay_invoice(response, csrf_header):
     payment = find_payment(
         response.text,
-        response.url
+        response.url,
     )
 
     if not payment:
-        log("⚪ 没找到支付按钮，可能账单已支付。")
+        log("⚪ 没找到支付按钮，可能已经支付。")
         return True
 
-    log("💳 找到支付入口，准备处理续期账单……")
+    log("💳 找到账单支付入口……")
+
+    headers = {
+        "Referer": response.url,
+    }
+
+    if csrf_header:
+        headers["X-CSRF-TOKEN"] = csrf_header
 
     if payment["type"] == "form":
         result = request(
             "POST",
             payment["url"],
             data=payment["data"],
-            headers={
-                "Referer": response.url,
-            },
+            headers=headers,
         )
+
     else:
         result = request(
             "GET",
             payment["url"],
-            headers={
-                "Referer": response.url,
-            },
+            headers=headers,
         )
 
     if result.status_code >= 400:
@@ -295,7 +366,7 @@ def pay_invoice(response):
     return True
 
 
-def check_unpaid_invoice(service_id):
+def check_unpaid_invoices(service_id, csrf_header):
     response = request(
         "GET",
         f"/service/{service_id}/invoices?where=unpaid",
@@ -303,10 +374,10 @@ def check_unpaid_invoice(service_id):
 
     soup = BeautifulSoup(
         response.text,
-        "html.parser"
+        "html.parser",
     )
 
-    invoice_urls = []
+    urls = []
 
     for link in soup.find_all("a", href=True):
         href = link["href"]
@@ -315,237 +386,317 @@ def check_unpaid_invoice(service_id):
             "/invoice/" in href
             and "download" not in href
         ):
-            invoice_urls.append(
+            urls.append(
                 urljoin(
                     response.url,
-                    href
+                    href,
                 )
             )
 
-    invoice_urls = list(
-        dict.fromkeys(invoice_urls)
-    )
+    urls = list(dict.fromkeys(urls))
 
-    if not invoice_urls:
-        log("⚪ 没有发现未支付账单。")
+    if not urls:
+        log("⚪ 没发现未支付账单。")
         return True
 
-    log(
-        f"📄 找到 {len(invoice_urls)} 个未支付账单。"
-    )
+    log(f"📄 找到 {len(urls)} 个未支付账单。")
 
-    for invoice_url in invoice_urls:
+    for invoice_url in urls:
         invoice = request(
             "GET",
-            invoice_url
+            invoice_url,
         )
 
-        if not pay_invoice(invoice):
+        if not pay_invoice(
+            invoice,
+            csrf_header,
+        ):
             return False
 
     return True
 
 
-def renew_service(service_id):
+def renew_service(service_id, csrf_header):
     log("")
     log("=" * 50)
-    log(f"🖥️ 处理服务 #{service_id}")
+    log(f"🖥️ 服务 #{service_id}")
 
     result = {
         "service_id": service_id,
-        "status": "unknown",
-        "old_due": "未知",
-        "new_due": "未知",
+        "status": "skip",
+        "old_due": None,
+        "new_due": None,
+        "message": "",
+        "notify": False,
         "success": True,
-        "detail": "",
     }
 
     manage_url = f"/service/{service_id}/manage"
 
     manage = request(
         "GET",
-        manage_url
+        manage_url,
     )
 
-    csrf = get_csrf(manage.text)
-    old_due = get_due_date(manage.text)
+    due_date = get_due_date(
+        manage.text
+    )
 
-    result["old_due"] = old_due
-    result["new_due"] = old_due
-
-    log(f"📅 当前到期时间：{old_due}")
-
-    if not csrf:
+    if not due_date:
         result["status"] = "failed"
         result["success"] = False
-        result["detail"] = "没有找到 CSRF Token"
+        result["notify"] = True
+        result["message"] = "无法识别服务到期日期"
+
+        log("❌ 无法识别服务到期日期。")
+        return result
+
+    result["old_due"] = due_date
+    result["new_due"] = due_date
+
+    today = datetime.now(
+        TIMEZONE
+    ).date()
+
+    target_date = (
+        due_date - timedelta(days=1)
+    )
+
+    log(
+        f"📅 当前到期日：{due_date.strftime('%Y/%m/%d')}"
+    )
+
+    log(
+        f"🎯 计划续期日：{target_date.strftime('%Y/%m/%d')} 23:00"
+    )
+
+    log(
+        f"🕐 今天：{today.strftime('%Y/%m/%d')}"
+    )
+
+    # 还没到目标日期
+    if today < target_date:
+        result["status"] = "skip"
+        result["message"] = "还没到续期日期"
+
+        log("🔕 还没到续期日期，本次不续期。")
+        return result
+
+    # 已经过期
+    if today > due_date:
+        result["status"] = "failed"
+        result["success"] = False
+        result["notify"] = True
+        result["message"] = "检测到服务到期日已经过去"
+
+        log("❌ 服务到期日已经过去。")
+        return result
+
+    # 到期日当天仍允许补救尝试
+    if today == due_date:
+        log("⚠️ 已到到期日，执行补救续期。")
+
+    else:
+        log("✅ 今天是到期前一天，开始续期。")
+
+    form_token = get_form_csrf(
+        manage.text
+    )
+
+    if not form_token:
+        result["status"] = "failed"
+        result["success"] = False
+        result["notify"] = True
+        result["message"] = "没有找到 CSRF Token"
 
         log("❌ 没找到 CSRF Token。")
         return result
 
-    log(f"🔄 尝试续期 {RENEW_DAYS} 天……")
+    headers = {
+        "Referer": urljoin(
+            BASE_URL,
+            manage_url,
+        ),
+    }
+
+    if csrf_header:
+        headers["X-CSRF-TOKEN"] = csrf_header
+
+    log(
+        f"🔄 正在提交 {RENEW_DAYS} 天续期……"
+    )
 
     renew = request(
         "POST",
         f"/service/{service_id}/renew",
         data={
-            "_token": csrf,
+            "_token": form_token,
             "days": str(RENEW_DAYS),
         },
-        headers={
-            "Referer": urljoin(
-                BASE_URL,
-                manage_url
-            ),
-            "X-CSRF-TOKEN": csrf,
-        },
+        headers=headers,
     )
 
     page_text = BeautifulSoup(
         renew.text,
-        "html.parser"
+        "html.parser",
     ).get_text(
         " ",
-        strip=True
+        strip=True,
     ).lower()
 
-    if (
-        "renewal restricted" in page_text
-        or "can only renew" in page_text
-        or "not eligible" in page_text
-        or "too early" in page_text
-    ):
-        result["status"] = "waiting"
-        result["detail"] = "暂未到允许续期时间"
+    restricted_words = [
+        "renewal restricted",
+        "can only renew",
+        "not eligible",
+        "too early",
+    ]
 
-        log("⏳ 还没到允许续期的时间。")
+    if any(
+        word in page_text
+        for word in restricted_words
+    ):
+        result["status"] = "restricted"
+        result["notify"] = True
+        result["message"] = (
+            "HidenCloud 暂未开放续期，请稍后手动再运行一次"
+        )
+
+        log("⏳ 当前暂时不允许续期。")
         return result
 
     if (
         "/invoice/" in renew.url
         or "/payment/invoice/" in renew.url
     ):
-        if not pay_invoice(renew):
+        if not pay_invoice(
+            renew,
+            csrf_header,
+        ):
             result["status"] = "failed"
             result["success"] = False
-            result["detail"] = "账单支付失败"
+            result["notify"] = True
+            result["message"] = "账单支付失败"
             return result
 
     else:
-        log("🔎 检查是否生成了未支付账单……")
+        log("🔎 检查未支付账单……")
 
-        if not check_unpaid_invoice(service_id):
+        if not check_unpaid_invoices(
+            service_id,
+            csrf_header,
+        ):
             result["status"] = "failed"
             result["success"] = False
-            result["detail"] = "处理账单失败"
+            result["notify"] = True
+            result["message"] = "账单处理失败"
             return result
 
     final_page = request(
         "GET",
-        manage_url
+        manage_url,
     )
 
-    new_due = get_due_date(
+    new_due_date = get_due_date(
         final_page.text
     )
 
-    result["new_due"] = new_due
-
-    log(
-        f"📅 处理后的到期时间：{new_due}"
-    )
+    if new_due_date:
+        result["new_due"] = new_due_date
 
     if (
-        old_due != "未知"
-        and new_due != "未知"
-        and old_due != new_due
+        new_due_date
+        and new_due_date != due_date
     ):
         result["status"] = "renewed"
-        result["detail"] = "到期时间已更新"
+        result["notify"] = True
+        result["message"] = "续期成功，到期日期已更新"
 
-        log("🎉 续期成功，到期时间已经变化。")
+        log(
+            "🎉 续期成功："
+            f"{due_date.strftime('%Y/%m/%d')}"
+            " → "
+            f"{new_due_date.strftime('%Y/%m/%d')}"
+        )
+
         return result
 
-    result["status"] = "checked"
-    result["detail"] = "检查完成，到期时间未变化"
-
-    log(
-        "ℹ️ 到期时间没有变化，"
-        "可能尚未到续期时间。"
+    result["status"] = "warning"
+    result["notify"] = True
+    result["message"] = (
+        "已执行续期流程，但到期日期没有变化，请检查"
     )
+
+    log("⚠️ 执行后到期日期没有变化。")
 
     return result
 
 
-def build_tg_message(results):
-    renewed = [
-        x for x in results
-        if x["status"] == "renewed"
+def date_text(value):
+    if not value:
+        return "未知"
+
+    return value.strftime("%Y/%m/%d")
+
+
+def build_notification(results):
+    important = [
+        item
+        for item in results
+        if item["notify"]
     ]
 
-    failed = [
-        x for x in results
-        if not x["success"]
-    ]
+    if not important:
+        return None
 
-    waiting = [
-        x for x in results
-        if x["status"] == "waiting"
-    ]
+    if any(
+        not item["success"]
+        for item in important
+    ):
+        title = "❌ HidenCloud 自动续期异常"
 
-    if failed:
-        title = "❌ HidenCloud 自动续期存在失败"
-
-    elif renewed:
+    elif any(
+        item["status"] == "renewed"
+        for item in important
+    ):
         title = "🎉 HidenCloud 续期成功"
 
-    elif waiting:
-        title = "⏳ HidenCloud 暂未到续期时间"
-
     else:
-        title = "✅ HidenCloud 自动续期检查完成"
+        title = "⚠️ HidenCloud 续期提醒"
 
     lines = [
         title,
         f"账号：{mask_email(EMAIL)}",
-        f"服务数量：{len(results)}",
         "",
     ]
 
-    for item in results:
-        service_id = item["service_id"]
-        old_due = item["old_due"]
-        new_due = item["new_due"]
+    for item in important:
+        lines.append(
+            f"服务：#{item['service_id']}"
+        )
 
         if item["status"] == "renewed":
-            status_text = "🎉 已续期"
+            lines.append("状态：🎉 续期成功")
 
-        elif item["status"] == "waiting":
-            status_text = "⏳ 暂未到续期时间"
+        elif item["status"] == "restricted":
+            lines.append("状态：⏳ 暂未允许续期")
 
         elif item["status"] == "failed":
-            status_text = "❌ 失败"
+            lines.append("状态：❌ 失败")
 
         else:
-            status_text = "✅ 检查完成"
+            lines.append("状态：⚠️ 需要检查")
 
         lines.append(
-            f"服务 #{service_id}"
-        )
-        lines.append(
-            f"状态：{status_text}"
-        )
-        lines.append(
-            f"原到期：{old_due}"
-        )
-        lines.append(
-            f"新到期：{new_due}"
+            f"原到期：{date_text(item['old_due'])}"
         )
 
-        if item["detail"]:
-            lines.append(
-                f"说明：{item['detail']}"
-            )
+        lines.append(
+            f"新到期：{date_text(item['new_due'])}"
+        )
+
+        lines.append(
+            f"说明：{item['message']}"
+        )
 
         lines.append("")
 
@@ -553,9 +704,16 @@ def build_tg_message(results):
 
 
 def main():
-    log("=" * 42)
-    log(" HidenCloud Auto Renew")
-    log("=" * 42)
+    log("=" * 50)
+    log(" HidenCloud 到期前一天自动续期")
+    log("=" * 50)
+
+    now = datetime.now(TIMEZONE)
+
+    log(
+        "🕐 北京时间："
+        + now.strftime("%Y/%m/%d %H:%M:%S")
+    )
 
     if not COOKIE_VALUE:
         fatal(
@@ -573,11 +731,11 @@ def main():
         path="/",
     )
 
-    log("🔐 正在使用 Cookie 登录……")
+    log("🔐 正在验证 HidenCloud 登录状态……")
 
     dashboard = request(
         "GET",
-        "/dashboard"
+        "/dashboard",
     )
 
     if (
@@ -585,8 +743,12 @@ def main():
         or "/login" in dashboard.url
     ):
         fatal(
-            "COOKIE_VALUE 已失效，请重新获取 Cookie。"
+            "COOKIE_VALUE 已失效，请重新获取 remember_web Cookie。"
         )
+
+    csrf_header = get_meta_csrf(
+        dashboard.text
+    )
 
     services = find_services(
         dashboard.text
@@ -594,18 +756,11 @@ def main():
 
     if not services:
         fatal(
-            "登录后没有找到任何服务器。"
+            "登录成功后没有找到服务器。"
         )
 
     log(
-        f"✅ 登录成功，找到 {len(services)} 个服务："
-    )
-
-    log(
-        ", ".join(
-            f"#{x}"
-            for x in services
-        )
+        f"✅ 登录成功，找到 {len(services)} 个服务。"
     )
 
     results = []
@@ -613,33 +768,39 @@ def main():
     for service_id in services:
         try:
             result = renew_service(
-                service_id
+                service_id,
+                csrf_header,
             )
 
             results.append(result)
 
         except Exception as exc:
             log(
-                f"❌ 服务 #{service_id} 出错：{exc}"
+                f"❌ 服务 #{service_id} 异常：{exc}"
             )
 
             results.append({
                 "service_id": service_id,
                 "status": "failed",
-                "old_due": "未知",
-                "new_due": "未知",
+                "old_due": None,
+                "new_due": None,
+                "message": str(exc),
+                "notify": True,
                 "success": False,
-                "detail": str(exc),
             })
 
-    log("")
-    log("=" * 50)
-
-    message = build_tg_message(
+    notification = build_notification(
         results
     )
 
-    send_tg(message)
+    if notification:
+        send_tg(notification)
+
+    else:
+        log(
+            "🔕 今天不是续期日，"
+            "不发送 Telegram。"
+        )
 
     failed = any(
         not item["success"]
@@ -647,7 +808,7 @@ def main():
     )
 
     if failed:
-        log("❌ 本次运行存在失败项目。")
+        log("❌ 本次检查存在错误。")
         sys.exit(1)
 
     log("✅ 本次检查完成。")
